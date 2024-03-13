@@ -4,31 +4,34 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use std::fmt::Debug;
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, select};
+use tokio_util::sync::CancellationToken;
+use log::{error, info,};
 
-use log::{error, info, Log, warn};
 
+type HostsShared = Arc<Mutex<HashSet<SocketAddrV4>>>;
 
-type Hosts_shared = Arc<Mutex<HashSet<SocketAddrV4>>>;
-
-pub async  fn listen (sock: Arc<UdpSocket>, hosts: Hosts_shared) {
-    loop {
+pub async  fn listen (
+    sock: Arc<UdpSocket>,
+    hosts: HostsShared,
+    token: CancellationToken
+) {
+    let recv = || async {
         let mut buf= vec![];
 
         match sock.recv_buf_from(&mut buf).await {
-            Ok((_size, addr)) => info!("Received message [random message] from {}", addr),
+            Ok((_size, addr)) => info!("Received message from {}", addr),
             Err(e) => {
                 error!("error to receive messasge: {}", e);
-                continue
-            },
+                return;
+            }
         }
 
         let mut lock  = match hosts.lock() {
             Ok(lock) => lock,
             Err(e) => {
                 error!("mutex.lock() error: {}", e);
-                continue
+                return;
             }
         };
 
@@ -36,23 +39,37 @@ pub async  fn listen (sock: Arc<UdpSocket>, hosts: Hosts_shared) {
             Ok(a) => a,
             Err(e) => {
                 error!("error to deserialize messsage: {}, binary message: {:?}", e, buf);
-                continue
+                return;
             }
         };
         lock.extend(&new_hosts);
-    }
-}
-pub async fn sender(sock: Arc<UdpSocket>, hosts: Hosts_shared, sec : u64, local: SocketAddrV4) {
-    let mut interval = tokio::time::interval(Duration::from_secs(sec));
+    };
 
     loop {
-        interval.tick().await;
+        select! {
+            _ = token.cancelled() => {
+                    info!("Shutdown listener");
+                    break;
+                },
+            _ = recv() => {}
+        }
+    }
+}
+pub async fn sender(
+    sock: Arc<UdpSocket>,
+    hosts: HostsShared,
+    sec : u64,
+    local: SocketAddrV4,
+    token: CancellationToken
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(sec));
 
+    let send = || async {
         let hosts  = match hosts.lock() {
             Ok(lock) => lock.clone(),
             Err(e) => {
                 error!("mutex.lock() error: {}", e);
-                continue
+                return;
             }
         };
 
@@ -60,7 +77,7 @@ pub async fn sender(sock: Arc<UdpSocket>, hosts: Hosts_shared, sec : u64, local:
             Ok(a) => a,
             Err(e) => {
                 error!("error to serialize data: {}, data: {:?}", e, &hosts);
-                continue
+                return;
             }
         };
 
@@ -68,13 +85,23 @@ pub async fn sender(sock: Arc<UdpSocket>, hosts: Hosts_shared, sec : u64, local:
             .filter(|&a| *a != local)
             .collect::<HashSet<&SocketAddrV4>>();
 
-        info!("Sending message to {:?}", hosts);
+        if !hosts.is_empty() {
+            info!("Sending message to {:?}", hosts);
+        }
         for addr in hosts {
-            if *addr != local {
-                sock.send_to(mes.as_bytes(), addr)
-                    .await
-                    .unwrap_or_else(error!("error to send message to {}", addr));
+            if sock.send_to(mes.as_bytes(), addr).await.is_err() {
+                error!("error to send message to {}", addr);
             }
+        }
+    };
+
+    loop {
+        select! {
+            _ = token.cancelled() => {
+                    info!("Shutdown sender");
+                    break;
+                },
+            _ = interval.tick() => send().await
         }
     }
 }
